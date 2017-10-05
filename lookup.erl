@@ -5,24 +5,28 @@
 %lookup(start, key) ->
 %    node = find_node(start, key).
 
-serve() ->
+servername(Pid) ->
+    {_, [{IpTuple,_,_}|_]} = inet:getif(),
+    Id = crypto:hash(md4, lists:flatten(io_lib:format("~p~p", [IpTuple, Pid]))),
+    lists:concat(lists:map(fun(X) -> integer_to_list(X, 16) end, binary:bin_to_list(Id))).
+
+serve(Suc) ->
     receive
+        {successor, S} ->
+            io:format("Changing successor from ~s to ~s~n", [Suc, S]),
+            serve(S);
         R ->
-            io:format("Got ~s~n", [R]),
-            serve()
+            io:format("Got ~s (successor ~s)~n", [R, Suc]),
+            serve(Suc)
     end.
 
-ping(Id, Msg) ->
-    Id ! Msg.
-
 run() ->
-    Pid = spawn(?MODULE, serve, []),
-    {_, [{IpTuple,_,_}|_]} = inet:getif(),
-    io:format("~p~p", [IpTuple, self()]),
-    Id = crypto:hash(md4, lists:flatten(io_lib:format("~p~p", [IpTuple, self()]))),
-    Name = lists:concat(lists:map(fun(X) -> integer_to_list(X, 16) end, binary:bin_to_list(Id))),
-    io:format("Server name ~s~n", [Name]),
+    io:format("Server name ~s~n", [servername(self())]),
+    Pid = spawn(?MODULE, serve, ["0"]),
+    Pid1 = spawn(?MODULE, serve, [servername(Pid)]),
+    io:format("Server name of child ~s~n", [servername(Pid)]),
 
-    ping(Pid, request1),
-    ping(Pid, request2),
+    Pid1 ! {successor, servername(Pid)},
+    Pid ! {successor, servername(Pid1)},
+    Pid ! request1,
     ok.
