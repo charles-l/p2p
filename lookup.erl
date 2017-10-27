@@ -7,55 +7,70 @@
 -define(MAXKEY, math:pow(2, ?KEYLEN)).
 
 dist(A, B) ->
+    <<X:128>> = A,
+    <<Y:128>> = B,
     if
-        A == B -> 0;
-        A < B -> B - A;
-        true -> ?MAXKEY + (B - A)
+        X == Y -> 0;
+        X < Y -> X - Y;
+        true -> ?MAXKEY + (X - Y)
     end.
 
--record(node, {serverid, successor_pid, hashtbl}).
+-record(node, {
+          server_id, % the hashed id of the server, used for bucket lookup
+          successor_pid, % the pid of the next node in the ring
+          hashtbl % the hash table for this node
+         }).
 
-servername(Pid) ->
+server_name(Pid) ->
     {_, [{IpTuple,_,_}|_]} = inet:getif(),
-    Id = crypto:hash(md4, lists:flatten(io_lib:format("~p~p", [IpTuple, Pid]))),
-    lists:concat(lists:map(fun(X) -> integer_to_list(X, 16) end, binary:bin_to_list(Id))).
+    crypto:hash(md4, lists:flatten(io_lib:format("~p~p", [IpTuple, Pid]))).
 
-make_node(Succ) ->
-    #node{serverid=servername(self()), successor_pid=Succ, hashtbl=dict:new()}.
+hash_key(K) ->
+    crypto:hash(md4, K).
 
-serve(ThisNode) ->
+start_node(Succ) ->
+    serve(#node{server_id=server_name(self()), successor_pid=Succ, hashtbl=dict:new()}).
+
+get_successor_id(SuccPID) ->
+    SuccPID ! {server_id, self()},
     receive
-        {id, P} ->
-            P ! ThisNode#node.serverid,
-            serve(ThisNode);
-        {get_successor, P} ->
-            P ! ThisNode#node.successor_pid,
-            serve(ThisNode);
-        {set_successor, S} ->
-            io:format("Changing successor from ~p to ~p~n", [ThisNode#node.successor_pid, S]),
-            serve(ThisNode#node{successor_pid=S});
-        {insert, K, V} ->
-            io:format("adding ~s -> ~s~n", [K, V]),
-            serve(dict:store(K, V, ThisNode#node.hashtbl));
-        {lookup, K, D} ->
-            D ! dict:find(K, ThisNode#node.hashtbl),
-            % TODO: send something back
-            serve(ThisNode);
-        R ->
-            io:format("Got ~s~n", [R]),
-            serve(ThisNode)
+        {id_response, R} -> R
     end.
+
+
+serve(State) ->
+    receive
+        {server_id, Return} ->
+            Return ! {id_response, State#node.server_id},
+            serve(State);
+        {set_successor, S} ->
+            io:format("Changing successor from ~p to ~p~n", [State#node.successor_pid, S]),
+            serve(State#node{successor_pid=S});
+        {insert, K, V} ->
+            H = hash_key(K),
+            io:format("adding ~s (~p) -> ~s~n", [K, H, V]),
+            serve(State#node{hashtbl = dict:store(H, V, State#node.hashtbl)});
+        {lookup, K, Return} ->
+            H = hash_key(K),
+            SuccID = get_successor_id(State#node.successor_pid),
+            case dist(State#node.server_id, H) < dist(SuccID, H) of
+                true -> io:format("DID IT WORK ~w~n", [dict:find(H, State#node.hashtbl)]), Return ! dict:find(H, State#node.hashtbl);
+                false -> State#node.successor_pid ! {lookup, H, Return} % forward on to next node in ring
+            end,
+            serve(State);
+        R ->
+            io:format("Got ~p~n", [R]),
+            serve(State)
+    end.
+
 
 run() ->
-    Pid = spawn(?MODULE, serve, [make_node(nil)]),
-    Pid1 = spawn(?MODULE, serve, [make_node(Pid)]),
-    Pid ! {id, self()},
-    receive
-        K -> io:format("Id of child ~s~n", [K])
-    end,
+    Pid = spawn(?MODULE, start_node, [nil]),
+    Pid1 = spawn(?MODULE, start_node, [Pid]),
 
     Pid1 ! {set_successor, Pid},
     Pid ! {set_successor, Pid1},
     Pid ! request1,
-    Pid ! {insert, "HI", "Yo"},
+    Pid1 ! {insert, "asdf", "Yo"},
+    Pid ! {lookup, "asdf", self()},
     ok.
