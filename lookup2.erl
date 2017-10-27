@@ -1,5 +1,27 @@
+% references:
+%   + https://learnxinyminutes.com/docs/erlang/
+%   + http://erlang-tutorials.colefichter.ca/dht1
+%   + http://www.linuxjournal.com/article/6797
+%   + http://erlang.org/doc/design_principles/gen_server_concepts.html
+%   + http://learnyousomeerlang.com/clients-and-servers
+%
+% lessons learned:
+%   + distributed applications are *hard*
+%   + ensuring order is difficult
+%     + gen_server helps with this
+%       + handles synchronization with handle_call
+%       + uniquely tags messages sent with handle_cast so processing is done on
+%         the correct message
+
 -module(lookup2).
 -compile([export_all]).
+-behavior(gen_server).
+-define(TIMEOUT, 3000).
+
+-record(state, {
+          next = nil,
+          id = nil
+}).
 
 hashstr(S) -> % hash a string and return a string
     <<H:160/big-unsigned-integer>> = crypto:hash(sha, S),
@@ -9,70 +31,56 @@ id() -> % convert IP address + pid into a hashed value
     {_, [{IpTuple,_,_}|_]} = inet:getif(),
     hashstr(lists:flatten(io_lib:format("~p~p", [IpTuple, self()]))).
 
-await_response() ->
-    receive
-        R -> R
-    after 1000 -> erlang:error(await_fail)
-    end.
+spawn_ring(N) ->
+    {ok, Head} = gen_server:start_link(?MODULE, #state{}, []),
+    gen_server:call(Head, {set_next, Head}),
+    lists:map(
+      fun({_, X}) -> gen_server:call(X, {join_ring, Head}) end,
+      [gen_server:start_link(?MODULE, #state{}, []) || _ <- lists:seq(1, N)]),
+    Head.
 
-id_from_pid(Pid) ->
-    Pid ! {id, self()},
-    {_, P, ID} = await_response(),
-    {P, ID}.
+init(S) -> {ok, S#state{id=id()}}.
 
-next_id_from_pid(Pid) ->
-    Pid ! {forward, 1, {id, self()}},
-    {_, P, ID} = await_response(),
-    {P, ID}.
+handle_call({id}, _From, State) ->
+    {reply, State#state.id, State};
+handle_call({next}, _From, State) ->
+    {reply, State#state.next, State};
+handle_call({set_next, N}, _From, State) ->
+    {reply, ok, State#state{next = N}};
+handle_call({join_ring, Head}, _From, State) ->
+    io:format("~p Attempting to join~n", [self()]),
+    gen_server:cast(Head, {find_bucket_position, State#state.id, self()}),
+    {Node, NextNode} = receive
+                           {target_pair, N, NN} -> {N, NN}
+                       after ?TIMEOUT ->
+                                 erlang:error(join_timeout)
+                       end,
+    gen_server:call(Node, {set_next, self()}),
+    io:format("~p joined ~p ~p~n", [self(), Node, NextNode]),
+    {reply, ok, State#state{next = NextNode}}.
 
-serve(Next) ->
-    receive
-        {set_next, N} ->
-            serve(N);
-        {join_ring, Head} ->
-            MyID = id(),
-            {HeadPID, HeadID} = id_from_pid(Head),
-            {NextPID, NextID} = next_id_from_pid(Head),
-            if
-                (MyID == NextID) -> erlang:error(server_id_collision);
-                ((HeadID == NextID) orelse
-                    (MyID > HeadID andalso MyID < NextID) orelse
-                    (HeadID > NextID)) -> % or end of loop
-                    HeadPID ! {set_next, self()},
-                    serve(NextPID);
-                % else
-                true ->
-                    {join_ring, NextID}
-            end;
-        {id, From} ->
-            From ! {id_response, self(), id()},
-            serve(Next);
-        {forward, N, M} when N < 1 ->
-            io:format("~p dropping ~p~n", [self(), M]),
-            self() ! M,
-            serve(Next);
-        {forward, N, M} -> % forward msg to next node
-            io:format("~p (~p) ~p forwarding ~p~n", [self(), id(), N, M]),
-            Next ! {forward, N - 1, M},
-            serve(Next);
-        R -> io:format("Got ~p~n", [R]),
-             serve(Next)
-    end.
-
-spawn_initial() ->
-    Node = spawn(?MODULE, serve, [nil]),
-    Node ! {set_next, Node}, % loop back on itself
-    Node.
-
-spawn_to_ring(R) ->
-    New = spawn(?MODULE, serve, [nil]),
-    New ! {join_ring, R},
-    New.
-
-start() ->
-    Ring = spawn_initial(),
-    [(fun () -> spawn_to_ring(Ring), timer:sleep(3000) end)() || _ <- lists:seq(1, 10)],
-    timer:sleep(1000),
-    Ring ! {forward, 9, "PING"},
-    ok.
-
+handle_cast({find_bucket_position, _NewID, From}, State) when self() == State#state.next ->
+    From ! {target_pair, self(), State#state.next},
+    {noreply, State};
+handle_cast({find_bucket_position, NewID, From}, State) ->
+    NextID = gen_server:call(State#state.next, {id}),
+    IsAtTail = State#state.id > NextID,
+    if
+        (self() == State#state.next) orelse
+        (NewID > State#state.id andalso
+         (IsAtTail orelse (NewID < NextID))) ->
+            From ! {target_pair, self(), State#state.next};
+        true ->
+            gen_server:cast(State#state.next, {find_bucket_position, NewID, From})
+    end,
+    {noreply, State};
+handle_cast({forward, N, M}, State) when N < 1 ->
+    io:format("~p Dropping ~p~n", [self(), M]),
+    {noreply, State};
+handle_cast({forward, N, M}, State) ->
+    io:format("~p Forwarding ~p to ~p~n", [self(), M, State#state.next]),
+    gen_server:cast(State#state.next, {forward, N - 1, M}),
+    {noreply, State};
+handle_cast(R, State) ->
+    io:format("Got ~p~n", [R]),
+    {noreply, State}.
