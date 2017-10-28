@@ -60,15 +60,17 @@ handle_call({join_ring, Head}, _From, State) ->
     {reply, ok, State#state{next = NextNode}}.
 
 handle_cast({find_bucket_position, _NewID, From}, State) when self() == State#state.next ->
+    io:format("== Base ==~n"),
     From ! {target_pair, self(), State#state.next},
     {noreply, State};
 handle_cast({find_bucket_position, NewID, From}, State) ->
+    io:format("== Next ==~n"),
     NextID = gen_server:call(State#state.next, {id}),
+    io:format("~p ~p ~p~n", [State#state.id, NewID, NextID]),
     IsAtTail = State#state.id > NextID,
     if
-        (self() == State#state.next) orelse
-        (NewID > State#state.id andalso
-         (IsAtTail orelse (NewID < NextID))) ->
+        (NewID > State#state.id andalso (NewID < NextID)) orelse
+        (IsAtTail andalso (NewID < NextID) orelse (NewID > State#state.id)) ->
             From ! {target_pair, self(), State#state.next};
         true ->
             gen_server:cast(State#state.next, {find_bucket_position, NewID, From})
