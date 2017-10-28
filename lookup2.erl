@@ -13,8 +13,9 @@
 %       + uniquely tags messages sent with handle_cast so processing is done on
 %         the correct message
 
--module(lookup2).
--compile([export_all]).
+-module(dht).
+-export([insert/3, lookup/2, spawn_ring/1, spawn_node/1]).
+-export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 -behavior(gen_server).
 -define(TIMEOUT, 3000).
 
@@ -52,7 +53,13 @@ spawn_ring(N) ->
       [gen_server:start_link(?MODULE, #state{}, []) || _ <- lists:seq(1, N)]),
     Head.
 
+spawn_node(Ring) ->
+    {ok, NewNode} = gen_server:start_link(?MODULE, #state{}, []),
+    gen_server:call(NewNode, {join_ring, Ring}),
+    NewNode.
+
 init(S) -> {ok, S#state{id=genid(), tbl=dict:new()}}.
+terminate(_, _) -> ok.
 
 is_between_buckets(NewID, NodeID, NextID) ->
     IsAtTail = NodeID > NextID,
@@ -64,6 +71,17 @@ is_between_buckets(NewID, NodeID, NextID) ->
             false
     end.
 
+find_bucket_pair(Head, ID, PID) ->
+    gen_server:cast(Head, {find_bucket_position, ID, PID}),
+    receive
+        {target_pair, N, NN} -> {N, NN}
+    after ?TIMEOUT ->
+              {error, timeout}
+    end.
+
+get_next_id(State) ->
+    gen_server:call(State#state.next, {id}).
+
 handle_call({id}, _From, State) ->
     {reply, State#state.id, State};
 handle_call({next}, _From, State) ->
@@ -71,28 +89,17 @@ handle_call({next}, _From, State) ->
 handle_call({set_next, N}, _From, State) ->
     {reply, ok, State#state{next = N}};
 handle_call({join_ring, Head}, _From, State) ->
-    gen_server:cast(Head, {find_bucket_position, State#state.id, self()}),
-    {Node, NextNode} = receive
-                           {target_pair, N, NN} -> {N, NN}
-                       after ?TIMEOUT ->
-                                 erlang:error(join_timeout)
-                       end,
-    gen_server:call(Node, {set_next, self()}),
-    io:format("~p joined ~p ~p~n", [self(), Node, NextNode]),
-    {reply, ok, State#state{next = NextNode}}.
+    case find_bucket_pair(Head, State#state.id, self()) of
+        {error, timeout} ->
+            {reply, timeout, State};
+        {Node, NextNode} ->
+            gen_server:call(Node, {set_next, self()}),
+            io:format("~p joined ~p ~p~n", [self(), Node, NextNode]),
+            {reply, ok, State#state{next = NextNode}}
+    end.
 
-handle_cast({insert, Key, Val}, State) ->
-    NextID = gen_server:call(State#state.next, {id}),
-    case is_between_buckets(Key, State#state.id, NextID) of
-        true ->
-            {noreply, State#state{tbl = dict:store(Key, Val, State#state.tbl)}};
-        false ->
-            gen_server:cast(State#state.next, {insert, Key, Val}),
-            {noreply, State}
-    end;
 handle_cast({lookup, Key, From}, State) ->
-    NextID = gen_server:call(State#state.next, {id}),
-    case is_between_buckets(Key, State#state.id, NextID) of
+    case is_between_buckets(Key, State#state.id, get_next_id(State)) of
         true ->
             From ! {lookup_for, Key, dict:find(Key, State#state.tbl)};
         false ->
@@ -103,14 +110,21 @@ handle_cast({find_bucket_position, _NewID, From}, State) when self() == State#st
     From ! {target_pair, self(), State#state.next},
     {noreply, State};
 handle_cast({find_bucket_position, NewID, From}, State) ->
-    NextID = gen_server:call(State#state.next, {id}),
-    case is_between_buckets(NewID, State#state.id, NextID) of
+    case is_between_buckets(NewID, State#state.id, get_next_id(State)) of
         true ->
             From ! {target_pair, self(), State#state.next};
         false ->
             gen_server:cast(State#state.next, {find_bucket_position, NewID, From})
     end,
     {noreply, State};
+handle_cast({insert, Key, Val}, State) ->
+    case is_between_buckets(Key, State#state.id, get_next_id(State)) of
+        true ->
+            {noreply, State#state{tbl = dict:store(Key, Val, State#state.tbl)}};
+        false ->
+            gen_server:cast(State#state.next, {insert, Key, Val}),
+            {noreply, State}
+    end;
 handle_cast({forward, N, M}, State) when N < 1 ->
     io:format("~p Dropping ~p~n", [State#state.id, M]),
     {noreply, State};
