@@ -14,7 +14,7 @@
 %         the correct message
 
 -module(dht).
--export([insert/3, lookup/2, spawn_ring/1, spawn_node/1]).
+-export([insert/3, lookup/2, spawn_ring/1, spawn_node/1, forward/3]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 -behavior(gen_server).
 -define(TIMEOUT, 3000).
@@ -44,6 +44,9 @@ lookup(Node, Key) ->
           after ?TIMEOUT -> erlang:error(lookup_timeout)
           end,
     Val.
+
+forward(Node, N, Msg) ->
+    gen_server:cast(Node, {forward, N, Msg}).
 
 spawn_ring(N) ->
     {ok, Head} = gen_server:start_link(?MODULE, #state{}, []),
@@ -101,6 +104,7 @@ handle_call({join_ring, Head}, _From, State) ->
 handle_cast({lookup, Key, From}, State) ->
     case is_between_buckets(Key, State#state.id, get_next_id(State)) of
         true ->
+            io:format("found ~p in ~p~n", [Key, self()]),
             From ! {lookup_for, Key, dict:find(Key, State#state.tbl)};
         false ->
             gen_server:cast(State#state.next, {lookup, Key, From})
@@ -120,6 +124,7 @@ handle_cast({find_bucket_position, NewID, From}, State) ->
 handle_cast({insert, Key, Val}, State) ->
     case is_between_buckets(Key, State#state.id, get_next_id(State)) of
         true ->
+            io:format("inserting ~p into ~p~n", [Val, self()]),
             {noreply, State#state{tbl = dict:store(Key, Val, State#state.tbl)}};
         false ->
             gen_server:cast(State#state.next, {insert, Key, Val}),
@@ -129,7 +134,7 @@ handle_cast({forward, N, M}, State) when N < 1 ->
     io:format("~p Dropping ~p~n", [State#state.id, M]),
     {noreply, State};
 handle_cast({forward, N, M}, State) ->
-    io:format("~p (~p) Forwarding ~p to ~p~n", [self(), dict:size(State#state.tbl), M, State#state.next]),
+    io:format("~p (~p keys in bucket) Forwarding ~p to ~p~n", [self(), dict:size(State#state.tbl), M, State#state.next]),
     gen_server:cast(State#state.next, {forward, N - 1, M}),
     {noreply, State};
 handle_cast(R, State) ->
