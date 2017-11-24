@@ -1,7 +1,7 @@
 % references:
 %   https://en.wikipedia.org/wiki/Chord_(peer-to-peer)
 -module(chord).
--export([spawn_ring/1, forward/2, lookup/2]).
+-export([spawn_ring/1, forward/2, lookup/2, insert/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -behavior(gen_server).
 -define(M, 10).
@@ -67,11 +67,33 @@ forward(Node, Message) -> % forward a message to the next node
 
 lookup(Node, Key) ->
     K = hashstr(Key),
-    gen_server:cast(Node, {find_successor, K, K, self()}),
+    gen_server:cast(Node, {lookup_forward, lookup, K, self()}),
     receive
-        {successor_for, K, V} -> V
+        {lookup_for, K, V} -> V
     after
         ?TIMEOUT -> {error, timeout}
+    end.
+
+insert(Node, Key, Val) ->
+    K = hashstr(Key),
+    gen_server:cast(Node, {lookup_forward, {insert, Val}, K, self()}),
+    receive
+        {insert_ok, K} -> {ok, K}
+    after
+        ?TIMEOUT -> {error, timeout}
+    end.
+
+% Intelligently forward to the next node using the finger table
+% FoundF : idpair -> void
+% ForwardF : idpair -> void
+find_successor(State, ID, ForwardF, FoundF) ->
+    Next = successor(State),
+    case between_rin(State#state.id, ID, Next#idpair.id) of
+        true ->
+            FoundF(Next);
+        _ ->
+            N = closest_preceding_from_self(State, ID),
+            ForwardF(N)
     end.
 
 % create a node in the dht
@@ -161,14 +183,37 @@ handle_cast({prev, From}, State) ->
 
 % find successor of ID
 handle_cast({find_successor, I, ID, From}, State) ->
-    Next = successor(State),
-    case between_rin(State#state.id, ID, Next#idpair.id) of
-        true ->
-            From ! {successor_for, I, Next};
-        _ ->
-            N = closest_preceding_from_self(State, ID),
-            gen_server:cast(N#idpair.pid, {find_successor, I, ID, From})
-    end,
+    find_successor(State, ID,
+                  fun(NextN) ->
+                          gen_server:cast(NextN#idpair.pid, {find_successor, I, ID, From})
+                  end,
+                  fun(FoundN) ->
+                          From ! {successor_for, I, FoundN}
+                  end),
+    {noreply, State};
+
+% lookup via find_successor
+handle_cast({lookup_forward, M, K, From}, State) ->
+    find_successor(State, K,
+                  fun(NextN) ->
+                          gen_server:cast(NextN#idpair.pid, {lookup_forward, M, K, From})
+                  end,
+                  fun(FoundN) ->
+                          gen_server:cast(FoundN#idpair.pid, {M, K, From})
+                  end),
+    {noreply, State};
+
+handle_cast({{insert, V}, K, From}, State) ->
+    From ! {insert_ok, K},
+    {noreply, State#state{tbl = dict:store(K, V, State#state.tbl)}};
+
+handle_cast({lookup, K, From}, State) ->
+    io:format("Found ~p on ~p~n", [K, self()]),
+    From ! {lookup_for, K,
+            case dict:find(K, State#state.tbl) of
+                error -> {error, not_found};
+                M -> M
+            end},
     {noreply, State};
 
 % P thinks it might be our predecessor
