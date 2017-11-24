@@ -1,172 +1,192 @@
 % references:
-%   + https://learnxinyminutes.com/docs/erlang/
-%   + http://erlang-tutorials.colefichter.ca/dht1
-%   + http://www.linuxjournal.com/article/6797
-%   + http://erlang.org/doc/design_principles/gen_server_concepts.html
-%   + http://learnyousomeerlang.com/clients-and-servers
-%
-% lessons learned:
-%   + distributed applications are *hard*, especially to debug
-%   + ensuring order is difficult
-%     + gen_server helps with this
-%       + handles synchronization with handle_call
-%       + uniquely tags messages sent with handle_cast so processing is done on
-%         the correct message
-
+%   https://en.wikipedia.org/wiki/Chord_(peer-to-peer)
 -module(chord).
--export([insert/3, lookup/2, spawn_ring/1, spawn_node/1, forward/3]).
--export([init/1, handle_call/3, handle_cast/2, terminate/2]).
+-export([spawn_ring/1, forward/2, lookup/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -behavior(gen_server).
 -define(M, 10).
 -define(MAX, round(math:pow(2, ?M))).
--define(TIMEOUT, 3000). % global timeout for casts
+-define(TICKINTERVAL, 2000).
+-define(TIMEOUT, 10000).
 
 -record(idpair, {
          id = nil,
-         pid = nil}).
+         pid = nil
+         }).
 
 -record(state, {
-          next = #idpair{}, % next id/pid
-          id = nil, % the server id
-          tbl = nil, % the servers local hashtable
+          id = nil, % the nodes id
+          prev = nil, % predecessor id/pid
+          tbl = nil, % the server's local hashtable
           finger = []
 }).
 
-hashmod(S) ->
-    <<H:160/big-unsigned-integer>> = crypto:hash(sha, S),
-    H rem ?MAX.
+setnth(L, I, N) -> % set the nth value in a list L
+    lists:sublist(L,I - 1) ++ [N] ++ lists:nthtail(I,L).
 
+successor(State) -> % get the first element in the finger table (the successor).
+    [S | _] = State#state.finger,
+    S.
+
+set_successor(State, Succ) -> % set the first element in the finger table
+    [_ | R] = State#state.finger,
+    State#state{finger = [Succ | R]}.
+
+selfpair(State) -> % generate an idpair from a nodes State
+    #idpair{id = State#state.id, pid = self()}.
+
+% formats I has a hash string
+formathash(I) ->
+    lists:flatten(io_lib:format("~40.16.0b", [I])).
+
+% generate a hash string for S
 hashstr(S) -> % hash a string and return a string of the hash
-    lists:flatten(io_lib:format("~40.16.0b", [hashmod(S)])).
+    <<H:160/big-unsigned-integer>> = crypto:hash(sha, S),
+    formathash(H rem ?MAX).
+
+% checks if B is in range (A, C).
+between(A, _, A) -> % edge case: one node in the ring pointing to itself
+    true;
+between(A, B, C) when A < C -> % range check
+    A < B andalso B < C;
+% edge case: when A and C are swapped, check the outside of the
+% range (i.e. the rest of the circle besides the range (A, C).
+between(A, B, C) ->
+    A < B orelse B < C.
+
+% between check, right inclusive, i.e. is B in (A, C].
+between_rin(A, B, C) ->
+    C == B orelse between(A, B, C).
 
 genid() -> % convert IP address + pid into a hashed value (so each server gets a unique id)
     {_, [{IpTuple,_,_}|_]} = inet:getif(),
     hashstr(lists:flatten(io_lib:format("~p~p", [IpTuple, self()]))).
 
-insert(Node, Key, Val) -> % generate insert call to add a key, value pair to the dht
-    gen_server:cast(Node, {insert, hashstr(Key), Val}).
+forward(Node, Message) -> % forward a message to the next node
+    gen_server:cast(Node, {forward, Message, 15}).
 
-lookup(Node, Key) -> % generate a lookup call and wait for response
+lookup(Node, Key) ->
     K = hashstr(Key),
-    gen_server:cast(Node, {lookup, K, self()}),
-    Val = receive
-              {lookup_for, K, R} -> R
-          after ?TIMEOUT -> erlang:error(lookup_timeout)
-          end,
-    Val.
+    gen_server:cast(Node, {find_successor, K, K, self()}),
+    receive
+        {successor_for, K, V} -> V
+    after
+        ?TIMEOUT -> {error, timeout}
+    end.
 
-forward(Node, N, Msg) -> % generate a forward call to forward message around ring
-    gen_server:cast(Node, {forward, N, Msg}).
+% create a node in the dht
+create() ->
+    {ok, N} = gen_server:start_link(?MODULE, #state{}, []),
+    N.
 
-spawn_ring(N) -> % spawn an initial ring of N servers (with buckets sorted)
-    {ok, Head} = gen_server:start_link(?MODULE, #state{}, []),
-    gen_server:call(Head, {set_next, Head}),
-    [spawn_node(Head) || _ <- lists:seq(1, N)]. % spawn N servers
+% create a node for the dht and have it join starting at Head
+create_and_join(Head) ->
+    N = create(),
+    gen_server:call(N, {join, Head}),
+    N.
 
-spawn_node(Ring) -> % spawn a node and make it join the ring
-    {ok, NewNode} = gen_server:start_link(?MODULE, #state{}, []),
-    gen_server:call(NewNode, {join_ring, Ring}),
-    NewNode.
+% spawn the initial ring
+spawn_ring(N) ->
+    H = create(),
+    [H | [create_and_join(H) || _ <- lists:seq(1, N)]].
+
+% find the closest node to ID that's directly before it
+closest_preceding_from_self(State, ID) ->
+    closest_preceding_node(selfpair(State), lists:reverse(State#state.finger), ID).
+
+% idpair -> [idpair] -> id -> idpair
+closest_preceding_node(Node, [], _) ->
+    Node;
+closest_preceding_node(Node, [H|T], ID) ->
+    case (H /= nil) andalso between(Node#idpair.id, H#idpair.id, ID) of
+        true -> H;
+        _ -> closest_preceding_node(Node, T, ID)
+    end.
 
 % init function for gen_server behavior
-init(S) -> {ok, S#state{id=genid(), tbl=dict:new()}}.
+init(S) ->
+    timer:send_interval(?TICKINTERVAL, tick),
+    ID = genid(),
+    {ok, S#state{id=ID, tbl=dict:new(), finger=[#idpair{id = ID, pid = self()} | [nil || _ <- lists:seq(2, ?M)]]}}.
+
 % terminate function for gen_server behavior
 terminate(_, _) -> ok.
 
-% determines if NewID should go between NodeID and NextID
-% (handles edge case of ring wrap around)
-is_between_buckets(NewID, NodeID, NextID) ->
-    IsAtTail = NodeID > NextID,
+% update the finger table (called every TICKINTERVAL)
+fix_fingers(State) ->
+    I = rand:uniform(?M),
+    IntID = list_to_integer(State#state.id, 16),
+    FingerID = formathash((IntID + round(math:pow(2, I - 1))) rem ?MAX),
+    Next = successor(State),
+    gen_server:cast(Next#idpair.pid, {find_successor, I, FingerID, self()}),
+    ok.
+
+% join a ring
+handle_call({join, H}, _From, State) ->
+    gen_server:cast(H, {find_successor, 1, State#state.id, self()}),
+    {reply, ok, State}.
+
+% update Ith successor to be N in the finger table
+handle_info({successor_for, I, N}, State) ->
+    {noreply, State#state{finger = setnth(State#state.finger, I, N)}};
+
+% tick handler (stabilize and fix fingers).
+handle_info(tick, State) ->
+    Next = successor(State),
     if
-        ((NewID > NodeID) andalso (NewID < NextID)) orelse
-        (IsAtTail andalso ((NewID < NextID) orelse (NewID > NodeID))) ->
-            true;
-        true ->
-            false
-    end.
-
-% creates a find_bucket_pair call
-% which walks around the Ring and checks whether the ID should be between
-% the current and next node - when found, returns the pair of pids for the current
-% and next node
-find_bucket_pair(Head, ID, PID) ->
-    gen_server:cast(Head, {find_bucket_position, ID, PID}),
-    receive
-        {target_pair, N, NN} -> {N, NN}
-    after ?TIMEOUT ->
-              {error, timeout}
-    end.
-
-set_next(State, NextPID) when self() == NextPID ->
-    State#state{next = #idpair{id = State#state.id, pid = self()}};
-set_next(State, NextPID) ->
-    NextID = gen_server:call(NextPID, {id}),
-    State#state{next = #idpair{id = NextID, pid = NextPID}}.
-set_next(State, NextPID, NextID) ->
-    State#state{next = #idpair{id = NextID, pid = NextPID}}.
-
-% get the id of the server
-handle_call({id}, _From, State) ->
-    {reply, State#state.id, State};
-% update the pid for the next node
-handle_call({set_next, N}, _From, State) ->
-    io:format("~p ~p ~p~n", [N, _From, self()]),
-    {reply, ok, set_next(State, N)};
-handle_call({set_next, N, NID}, _From, State) ->
-    {reply, ok, set_next(State, N, NID)};
-% join a ring starting at the head node
-handle_call({join_ring, Head}, _From, State) ->
-    case find_bucket_pair(Head, State#state.id, self()) of
-        {error, timeout} ->
-            {reply, timeout, State};
-        {PrevNode, NextNode} ->
-            gen_server:call(PrevNode, {set_next, self(), State#state.id}),
-            io:format("~p joined ~p ~p~n", [self(), PrevNode, NextNode]),
-            {reply, ok, set_next(State, NextNode)}
-    end.
-% lookup a key in the dht and return the value to the sender
-handle_cast({lookup, Key, From}, State) ->
-    case is_between_buckets(Key, State#state.id, State#state.next#idpair.id) of
-        true ->
-            io:format("found ~p in ~p~n", [Key, self()]),
-            From ! {lookup_for, Key, dict:find(Key, State#state.tbl)};
-        false ->
-            gen_server:cast(State#state.next#idpair.pid, {lookup, Key, From})
+        Next /= nil -> gen_server:cast(Next#idpair.pid, {prev, self()})
     end,
+    fix_fingers(State),
     {noreply, State};
-% find the bucket position when there's only one node in the ring
-handle_cast({find_bucket_position, _NewID, From}, State) when self() == State#state.next#idpair.pid ->
-    From ! {target_pair, self(), State#state.next#idpair.pid},
-    {noreply, State};
-% find the best position for NewID
-handle_cast({find_bucket_position, NewID, From}, State) ->
-    case is_between_buckets(NewID, State#state.id, State#state.next#idpair.id) of
+
+% generic message
+handle_info(M, State) ->
+    io:format("~p Unknown message ~p~n", [self(), M]),
+    {noreply, State}.
+
+% stabilize this node, (given X = successors predecessor)
+handle_cast({stabilize, X}, State) ->
+    Next = successor(State),
+    case X /= nil andalso between(State#state.id, X#idpair.id, Next#idpair.id) of
         true ->
-            From ! {target_pair, self(), State#state.next#idpair.pid};
-        false ->
-            gen_server:cast(State#state.next#idpair.pid, {find_bucket_position, NewID, From})
-    end,
-    {noreply, State};
-% insert a key, value pair in to the dht
-handle_cast({insert, Key, Val}, State) ->
-    case is_between_buckets(Key, State#state.id, State#state.next#idpair.id) of
-        true ->
-            io:format("inserting ~p into ~p~n", [Val, self()]),
-            {noreply, State#state{tbl = dict:store(Key, Val, State#state.tbl)}};
-        false ->
-            gen_server:cast(State#state.next#idpair.pid, {insert, Key, Val}),
+            {noreply, set_successor(State, X)};
+        _ ->
+            gen_server:cast(Next#idpair.pid, {notify, selfpair(State)}),
             {noreply, State}
     end;
-% drop a message when N is 0
-handle_cast({forward, N, M}, State) when N < 1 ->
-    io:format("~p Dropping ~p~n", [State#state.id, M]),
+% tell the node that requested this nodes predecessor to stabilize
+handle_cast({prev, From}, State) ->
+    gen_server:cast(From, {stabilize, State#state.prev}),
     {noreply, State};
-% forward a message to the next node (repeat N times)
-handle_cast({forward, N, M}, State) ->
-    io:format("~p (~p keys in bucket) Forwarding ~p to ~p~n", [self(), dict:size(State#state.tbl), M, State#state.next]),
-    gen_server:cast(State#state.next#idpair.pid, {forward, N - 1, M}),
+
+% find successor of ID
+handle_cast({find_successor, I, ID, From}, State) ->
+    Next = successor(State),
+    case between_rin(State#state.id, ID, Next#idpair.id) of
+        true ->
+            From ! {successor_for, I, Next};
+        _ ->
+            N = closest_preceding_from_self(State, ID),
+            gen_server:cast(N#idpair.pid, {find_successor, I, ID, From})
+    end,
     {noreply, State};
-% print every other message received
-handle_cast(R, State) ->
-    io:format("Got ~p~n", [R]),
+
+% P thinks it might be our predecessor
+handle_cast({notify, P}, State) ->
+    % P needs to be an idpair
+    case (State#state.prev == nil) orelse
+         between(State#state.prev#idpair.id, P#idpair.id, State#state.id) of
+        true ->
+            {noreply, State#state{prev = P}};
+        _ ->
+            {noreply, State}
+    end;
+handle_cast({forward, Msg, N}, State) when N == 0 ->
+    io:format("~p Dropping ~p~n", [self(), Msg]),
+    {noreply, State};
+% forward a message to the direct predecessor
+handle_cast({forward, Msg, N}, State) ->
+    Next = successor(State),
+    io:format("~p Forwarding ~p to ~p~n", [self(), Msg, Next]),
+    gen_server:cast(Next#idpair.pid, {forward, Msg, N - 1}),
     {noreply, State}.
