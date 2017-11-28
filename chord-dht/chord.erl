@@ -6,7 +6,7 @@
 -behavior(gen_server).
 -define(M, 10).
 -define(MAX, round(math:pow(2, ?M))).
--define(TICKINTERVAL, 2000).
+-define(TICKINTERVAL, 1000).
 -define(TIMEOUT, 10000).
 
 -record(idpair, {
