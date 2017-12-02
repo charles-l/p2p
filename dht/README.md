@@ -17,7 +17,7 @@ To lookup a key:
 
 # Lessons learned
 
-* Distributed applications are hard (especially from a timing perspective)
+* Distributed applications are hard (especially from a timing and ordering perspective)
 * A simple DHT can be implemented as a linked list of buckets
 
 # Use case
